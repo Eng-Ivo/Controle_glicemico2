@@ -34,9 +34,27 @@
             -ms-overflow-style: none;
             scrollbar-width: none;
         }
+        #loading-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(255,255,255,0.8);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 50;
+            backdrop-filter: blur(2px);
+        }
     </style>
 </head>
 <body class="text-gray-800">
+
+<!-- Tela de carregamento enquanto conecta ao banco de dados -->
+<div id="loading-overlay">
+    <div class="flex flex-col items-center gap-2">
+        <i data-lucide="loader-2" class="w-8 h-8 text-green-600 animate-spin"></i>
+        <p class="text-sm font-semibold text-green-700">Conectando ao banco de dados...</p>
+    </div>
+</div>
 
 <div class="app-container flex flex-col relative pb-20">
     
@@ -118,7 +136,7 @@
         <section>
             <h2 class="text-lg font-bold text-gray-700 mb-4 px-1">Histórico Recente</h2>
             <div id="history-list" class="flex flex-col gap-3">
-                <!-- Os itens serão gerados aqui pelo JavaScript -->
+                <p class="text-sm text-gray-400 text-center py-4">Sem registos ainda.</p>
             </div>
         </section>
 
@@ -144,21 +162,84 @@
 
 </div>
 
-<script>
+<script type="module">
+    // Importações do Firebase v11
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+    import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+    import { getFirestore, collection, onSnapshot, doc, setDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+    // Configuração do Firebase disponibilizada pelo ambiente
+    let firebaseConfig = {};
+    try {
+        if (typeof __firebase_config !== 'undefined') {
+            firebaseConfig = JSON.parse(__firebase_config);
+        }
+    } catch (e) { console.error("Erro ao carregar configurações do banco de dados", e); }
+    
+    const app = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+    const db = getFirestore(app);
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'glicemia-app-ivo';
+
+    let currentUser = null;
+    let entries = []; // Agora inicia vazio e será preenchido pelo banco de dados
+    let chartInstance = null;
+
     // Inicializar ícones
     lucide.createIcons();
 
-    // Estado da aplicação (em memória)
-    // Dados de exemplo para o gráfico não estar vazio no primeiro acesso
-    let entries = [
-        { id: 1, value: 110, moment: 'Jejum', timestamp: new Date(Date.now() - 24 * 60 * 60 * 1000).getTime() },
-        { id: 2, value: 145, moment: 'Pós-refeição', timestamp: new Date(Date.now() - 20 * 60 * 60 * 1000).getTime() },
-        { id: 3, value: 85, moment: 'Pré-refeição', timestamp: new Date(Date.now() - 15 * 60 * 60 * 1000).getTime() },
-        { id: 4, value: 195, moment: 'Pós-refeição', timestamp: new Date(Date.now() - 10 * 60 * 60 * 1000).getTime() },
-        { id: 5, value: 120, moment: 'Ao deitar', timestamp: new Date(Date.now() - 5 * 60 * 60 * 1000).getTime() }
-    ];
+    // 1. AUTENTICAÇÃO E CONEXÃO INICIAL
+    const initAuth = async () => {
+        try {
+            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                await signInWithCustomToken(auth, __initial_auth_token);
+            } else {
+                await signInAnonymously(auth);
+            }
+        } catch (error) {
+            console.error("Erro na autenticação:", error);
+            document.getElementById('loading-overlay').style.display = 'none';
+        }
+    };
+    initAuth();
 
-    let chartInstance = null;
+    onAuthStateChanged(auth, (user) => {
+        currentUser = user;
+        if (user) {
+            // Se autenticado com sucesso, começar a buscar os dados
+            setupRealtimeListener();
+        }
+    });
+
+    // 2. BUSCAR DADOS DO SERVIDOR EM TEMPO REAL
+    let unsubscribeSnapshot = null;
+    function setupRealtimeListener() {
+        if (!currentUser) return;
+        
+        // Caminho privado e seguro para os dados do usuário
+        const entriesRef = collection(db, 'artifacts', appId, 'users', currentUser.uid, 'glucose_entries');
+        
+        if (unsubscribeSnapshot) unsubscribeSnapshot();
+
+        unsubscribeSnapshot = onSnapshot(entriesRef, (snapshot) => {
+            entries = [];
+            snapshot.forEach((doc) => {
+                entries.push({ id: doc.id, ...doc.data() });
+            });
+            
+            // Atualizar interface com os dados novos do banco
+            renderHistory();
+            renderChart();
+            updateAverage();
+
+            // Esconder tela de carregamento após a primeira busca
+            document.getElementById('loading-overlay').style.display = 'none';
+
+        }, (error) => {
+            console.error("Erro ao buscar dados do servidor:", error);
+            document.getElementById('loading-overlay').style.display = 'none';
+        });
+    }
 
     // Função para calcular a HbA1c estimada baseada na média (fórmula ADAG)
     function calculateHbA1c(avgGlucose) {
@@ -172,15 +253,23 @@
         return { label: 'Normal', color: '#10b981', bgClass: 'bg-green-100', textClass: 'text-green-700' }; // Verde
     }
 
-    // Função para atualizar a lista na interface
+    // Atualizar a lista na interface
     function renderHistory() {
         const listContainer = document.getElementById('history-list');
         listContainer.innerHTML = '';
 
+        if (entries.length === 0) {
+            listContainer.innerHTML = '<p class="text-sm text-gray-400 text-center py-4">Nenhum registo encontrado.</p>';
+            return;
+        }
+
         // Ordenar do mais recente para o mais antigo para a lista
         const sortedEntries = [...entries].sort((a, b) => b.timestamp - a.timestamp);
 
-        sortedEntries.forEach(entry => {
+        // Mostrar apenas os 10 últimos na lista principal para não ficar gigante
+        const recentEntries = sortedEntries.slice(0, 10);
+
+        recentEntries.forEach(entry => {
             const date = new Date(entry.timestamp);
             const timeString = date.toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' });
             const dateString = date.toLocaleDateString('pt-PT', { day: '2-digit', month: 'short' });
@@ -207,29 +296,30 @@
             listContainer.appendChild(el);
         });
         
-        // Re-renderizar ícones nos novos elementos
         lucide.createIcons();
     }
 
-    // Função para atualizar o gráfico
+    // Atualizar o gráfico
     function renderChart() {
         const ctx = document.getElementById('glucoseChart').getContext('2d');
         
         // Ordenar do mais antigo para o mais recente para o gráfico
         const sortedEntries = [...entries].sort((a, b) => a.timestamp - b.timestamp);
 
-        const labels = sortedEntries.map(e => {
+        // Limitar gráfico aos últimos 15 registros
+        const chartEntries = sortedEntries.slice(-15);
+
+        const labels = chartEntries.map(e => {
             const d = new Date(e.timestamp);
-            return d.toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' });
+            return d.toLocaleDateString('pt-PT', { day: '2-digit', month: '2-digit' }) + ' ' + 
+                   d.toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' });
         });
         
-        const dataValues = sortedEntries.map(e => e.value);
-        
-        // Cores dos pontos baseadas no valor
+        const dataValues = chartEntries.map(e => e.value);
         const pointColors = dataValues.map(val => getStatus(val).color);
 
         if (chartInstance) {
-            chartInstance.destroy(); // Destrói o gráfico anterior antes de desenhar o novo
+            chartInstance.destroy();
         }
 
         chartInstance = new Chart(ctx, {
@@ -239,7 +329,7 @@
                 datasets: [{
                     label: 'Glicemia (mg/dL)',
                     data: dataValues,
-                    borderColor: '#a7f3d0', // Verde muito claro para a linha
+                    borderColor: '#a7f3d0', 
                     borderWidth: 3,
                     pointBackgroundColor: pointColors,
                     pointBorderColor: '#ffffff',
@@ -247,7 +337,7 @@
                     pointRadius: 6,
                     pointHoverRadius: 8,
                     fill: false,
-                    tension: 0.4 // Curvas suaves
+                    tension: 0.4
                 }]
             },
             options: {
@@ -272,26 +362,17 @@
                         beginAtZero: false,
                         suggestedMin: 50,
                         suggestedMax: 250,
-                        grid: {
-                            color: '#f3f4f6',
-                            drawBorder: false
-                        },
-                        ticks: {
-                            font: { size: 10, family: 'system-ui' },
-                            color: '#9ca3af'
-                        }
+                        grid: { color: '#f3f4f6', drawBorder: false },
+                        ticks: { font: { size: 10, family: 'system-ui' }, color: '#9ca3af' }
                     },
                     x: {
                         grid: { display: false },
                         ticks: {
-                            font: { size: 10, family: 'system-ui' },
-                            color: '#9ca3af',
-                            maxTicksLimit: 5
+                            display: false // Oculta os rótulos do eixo X para manter limpo, mas eles aparecem no tooltip
                         }
                     }
                 }
             },
-            // Plugin customizado para desenhar a área alvo (70-180)
             plugins: [{
                 id: 'targetZone',
                 beforeDraw: (chart) => {
@@ -302,10 +383,9 @@
                     const y180 = y.getPixelForValue(180);
                     
                     if (y70 && y180) {
-                        ctx.fillStyle = 'rgba(16, 185, 129, 0.05)'; // Fundo verde super transparente
+                        ctx.fillStyle = 'rgba(16, 185, 129, 0.05)';
                         ctx.fillRect(left, y180, width, y70 - y180);
                         
-                        // Linha pontilhada superior (180)
                         ctx.beginPath();
                         ctx.setLineDash([5, 5]);
                         ctx.moveTo(left, y180);
@@ -313,7 +393,6 @@
                         ctx.strokeStyle = 'rgba(16, 185, 129, 0.3)';
                         ctx.stroke();
                         
-                        // Linha pontilhada inferior (70)
                         ctx.beginPath();
                         ctx.moveTo(left, y70);
                         ctx.lineTo(right, y70);
@@ -337,8 +416,8 @@
         document.getElementById('estimated-hba1c').innerText = calculateHbA1c(avg);
     }
 
-    // Função principal para adicionar um novo registo
-    function addEntry() {
+    // 3. SALVAR NOVO REGISTO NO BANCO DE DADOS
+    window.addEntry = async function() {
         const valueInput = document.getElementById('glucose-input');
         const momentInput = document.getElementById('moment-input');
         const alertMsg = document.getElementById('alert-message');
@@ -352,40 +431,52 @@
             return;
         }
 
-        const newEntry = {
-            id: Date.now(),
+        if (!currentUser) {
+            alert("Aguarde a conexão com o banco de dados antes de salvar.");
+            return;
+        }
+
+        const timestamp = Date.now();
+        const entryData = {
             value: value,
             moment: moment,
-            timestamp: Date.now()
+            timestamp: timestamp
         };
 
-        entries.push(newEntry);
-        
-        // Limpar input e dar feedback visual
-        valueInput.value = '';
-        valueInput.blur();
-        
-        // Atualizar interface
-        renderHistory();
-        renderChart();
-        updateAverage();
+        // Mostrar tela de carregamento rápido
+        const btn = event.currentTarget;
+        const originalText = btn.innerHTML;
+        btn.innerHTML = '<i data-lucide="loader-2" class="w-5 h-5 animate-spin"></i> Salvando...';
+        lucide.createIcons();
+        btn.disabled = true;
+
+        try {
+            // Salvar no Firestore
+            const entryRef = doc(collection(db, 'artifacts', appId, 'users', currentUser.uid, 'glucose_entries'), timestamp.toString());
+            await setDoc(entryRef, entryData);
+            
+            // Limpar input
+            valueInput.value = '';
+            valueInput.blur();
+        } catch (error) {
+            console.error("Erro ao salvar:", error);
+            alert("Ocorreu um erro ao salvar os dados no servidor.");
+        } finally {
+            // Restaurar botão
+            btn.innerHTML = originalText;
+            btn.disabled = false;
+            lucide.createIcons();
+        }
     }
 
-    // Inicialização da página
-    window.onload = function() {
-        renderHistory();
-        renderChart();
-        updateAverage();
+    // Definir o mês atual no campo de relatório por padrão
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    document.getElementById('report-month').value = `${year}-${month}`;
 
-        // NOVO: Definir o mês atual no campo de relatório por padrão
-        const now = new Date();
-        const year = now.getFullYear();
-        const month = String(now.getMonth() + 1).padStart(2, '0');
-        document.getElementById('report-month').value = `${year}-${month}`;
-    };
-
-    // NOVA FUNÇÃO: Gerar o PDF do mês selecionado
-    function generatePDF() {
+    // 4. GERAR PDF COM OS DADOS DO BANCO
+    window.generatePDF = function() {
         const monthInput = document.getElementById('report-month').value;
         if (!monthInput) {
             alert("Por favor, selecione um mês válido.");
@@ -394,7 +485,7 @@
 
         const [year, month] = monthInput.split('-');
         
-        // Filtrar registos apenas do mês e ano selecionados
+        // Filtrar registos (já vieram do banco de dados) do mês selecionado
         const filteredEntries = entries.filter(entry => {
             const entryDate = new Date(entry.timestamp);
             return entryDate.getFullYear() == year && (entryDate.getMonth() + 1) == parseInt(month);
@@ -416,21 +507,19 @@
         const patientName = "Ivo José de Oliveira";
         const birthDateStr = "16/05/1969";
         
-        // Calcular a idade com base na data atual
         const [bDay, bMonth, bYear] = birthDateStr.split('/');
         const birthDateObj = new Date(bYear, bMonth - 1, bDay);
         const today = new Date();
         
         let age = today.getFullYear() - birthDateObj.getFullYear();
         const m = today.getMonth() - birthDateObj.getMonth();
-        // Ajusta se o aniversário ainda não passou este ano
         if (m < 0 || (m === 0 && today.getDate() < birthDateObj.getDate())) {
             age--;
         }
 
         // Cabeçalho do Documento
         doc.setFontSize(20);
-        doc.setTextColor(22, 163, 74); // Verde base do sistema
+        doc.setTextColor(22, 163, 74); 
         doc.text(`Relatório de Glicemia`, 14, 22);
         
         // Imprimir Dados do Paciente
@@ -443,7 +532,7 @@
         doc.setTextColor(120, 120, 120);
         doc.text(`Período do Relatório: ${month}/${year}`, 14, 48);
 
-        // Calcular Estatísticas Básicas do mês
+        // Calcular Estatísticas
         const sum = filteredEntries.reduce((acc, curr) => acc + curr.value, 0);
         const avg = Math.round(sum / filteredEntries.length);
         const max = Math.max(...filteredEntries.map(e => e.value));
@@ -454,7 +543,6 @@
         doc.setTextColor(50, 50, 50);
         doc.text(`Resumo:  Média: ${avg} mg/dL   |   HbA1c Est.: ${hba1c}%   |   Mín/Máx: ${min}/${max} mg/dL`, 14, 58);
 
-        // Preparar dados para a tabela
         const tableData = filteredEntries.map(entry => {
             const date = new Date(entry.timestamp);
             const dateStr = date.toLocaleDateString('pt-PT');
@@ -463,25 +551,22 @@
             return [dateStr, timeStr, `${entry.value} mg/dL`, entry.moment, status];
         });
 
-        // Gerar a Tabela (ajustado startY para caber os novos dados acima)
         doc.autoTable({
             startY: 64,
             head: [['Data', 'Hora', 'Valor', 'Momento', 'Estado']],
             body: tableData,
-            headStyles: { fillColor: [22, 163, 74] }, // Cabeçalho verde
-            alternateRowStyles: { fillColor: [240, 253, 244] }, // Linhas alternadas com fundo verde clarinho
+            headStyles: { fillColor: [22, 163, 74] }, 
+            alternateRowStyles: { fillColor: [240, 253, 244] }, 
             styles: { fontSize: 10, cellPadding: 3 },
             didParseCell: function(data) {
-                // Colorir a coluna de "Estado" de acordo com o resultado
                 if (data.section === 'body' && data.column.index === 4) {
-                    if (data.cell.raw === 'Hiper') data.cell.styles.textColor = [220, 38, 38]; // Vermelho
-                    if (data.cell.raw === 'Hipo') data.cell.styles.textColor = [37, 99, 235];  // Azul
-                    if (data.cell.raw === 'Normal') data.cell.styles.textColor = [22, 163, 74]; // Verde
+                    if (data.cell.raw === 'Hiper') data.cell.styles.textColor = [220, 38, 38]; 
+                    if (data.cell.raw === 'Hipo') data.cell.styles.textColor = [37, 99, 235];  
+                    if (data.cell.raw === 'Normal') data.cell.styles.textColor = [22, 163, 74]; 
                 }
             }
         });
 
-        // Adicionar rodapé em todas as páginas
         const pageCount = doc.internal.getNumberOfPages();
         for (let i = 1; i <= pageCount; i++) {
             doc.setPage(i);
@@ -490,10 +575,8 @@
             doc.text(`Gerado via Meu Controlo de Glicemia - Página ${i} de ${pageCount}`, 14, doc.internal.pageSize.height - 10);
         }
 
-        // Guardar o ficheiro PDF
         doc.save(`Glicemia_Ivo_Oliveira_${year}_${month}.pdf`);
     }
-
 </script>
 </body>
 </html>
